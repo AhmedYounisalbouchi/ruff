@@ -1708,3 +1708,24 @@ def _(args_tuple: tuple[int, int], args_union: tuple[int] | tuple[int, int], kwa
     f(*args_tuple, **kwargs)  # fine
     f(*args_union, **kwargs)  # fine
 ```
+
+The same contextual inference should apply to overloaded calls for each matching overload:
+
+```py
+from typing import Any, Literal, TypedDict, overload
+
+class InputMessage(TypedDict):
+    role: Literal["user"]
+    content: str
+
+@overload
+def create(*, input: list[InputMessage]) -> int: ...
+@overload
+def create(*, input: str) -> str: ...
+def create(**kwargs: Any) -> object: ...
+def ok(content: str) -> None:
+    kwargs: dict[str, Any] = {
+        "input": [{"role": "user", "content": content}],
+    }
+    reveal_type(create(**kwargs))  # revealed: int
+```

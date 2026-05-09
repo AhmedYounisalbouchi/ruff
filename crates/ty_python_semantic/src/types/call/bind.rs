@@ -3325,8 +3325,18 @@ impl<'db> CallableBinding<'db> {
                 let slots = overload
                     .argument_matches
                     .iter()
-                    .zip(arguments.iter_types())
-                    .flat_map(move |(matched_argument, argument_types)| {
+                    .zip(arguments.iter())
+                    .flat_map(move |(matched_argument, (argument, argument_types))| {
+                        let keyword_context = if matches!(argument, Argument::Keywords) {
+                            Some(keyword_argument_context(
+                                overload.signature.parameters(),
+                                matched_argument,
+                            ))
+                            .filter(|context| !context.is_empty())
+                        } else {
+                            None
+                        };
+
                         matched_argument.iter().map(
                             move |(parameter_index, variadic_argument_type)| {
                                 // TODO: For an unannotated `self` / `cls` parameter, the type should be
@@ -3335,10 +3345,27 @@ impl<'db> CallableBinding<'db> {
                                     [parameter_index]
                                     .annotated_type()
                                     .apply_optional_specialization(db, overload.specialization);
+                                let argument_type =
+                                    argument_types.get_for_declared_type(parameter_type);
+                                let variadic_argument = if matches!(argument, Argument::Keywords) {
+                                    keyword_context
+                                        .as_deref()
+                                        .and_then(|context| {
+                                            keyword_context_field_type(
+                                                overload.signature.parameters(),
+                                                argument_types,
+                                                context,
+                                                parameter_index,
+                                            )
+                                        })
+                                        .or(variadic_argument_type)
+                                } else {
+                                    variadic_argument_type
+                                };
                                 OverloadFilterSlot {
                                     parameter: parameter_type,
-                                    argument: argument_types.get_for_declared_type(parameter_type),
-                                    variadic_argument: variadic_argument_type,
+                                    argument: argument_type,
+                                    variadic_argument,
                                 }
                             },
                         )
@@ -4513,6 +4540,38 @@ fn validate_keyword_unpack_key_type<'db>(
     }
 }
 
+pub(crate) fn keyword_argument_context<'db>(
+    parameters: &Parameters<'db>,
+    matched_argument: &MatchedArgument<'db>,
+) -> SmallVec<[(Name, Type<'db>); 4]> {
+    matched_argument
+        .parameters
+        .iter()
+        .filter_map(|parameter_index| {
+            let parameter = &parameters[*parameter_index];
+            if parameter.is_keyword_variadic() {
+                return None;
+            }
+
+            Some((
+                parameter.keyword_name()?.clone(),
+                parameter.annotated_type(),
+            ))
+        })
+        .collect()
+}
+
+fn keyword_context_field_type<'db>(
+    parameters: &Parameters<'db>,
+    argument_types: &CallArgumentTypes<'db>,
+    context: &[(Name, Type<'db>)],
+    parameter_index: usize,
+) -> Option<Type<'db>> {
+    parameters[parameter_index]
+        .keyword_name()
+        .and_then(|name| argument_types.get_field_for_keyword_context(context, name))
+}
+
 impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -4802,9 +4861,19 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         let mut assignable_to_declared_type = true;
 
         let parameters = self.signature.parameters();
-        for (argument_index, adjusted_argument_index, _, argument_types) in
+        for (argument_index, adjusted_argument_index, argument, argument_types) in
             self.enumerate_argument_types()
         {
+            let keyword_context = if matches!(argument, Argument::Keywords) {
+                Some(keyword_argument_context(
+                    self.signature.parameters(),
+                    &self.argument_matches[argument_index],
+                ))
+                .filter(|context| !context.is_empty())
+            } else {
+                None
+            };
+
             for (parameter_index, variadic_argument_type) in
                 self.argument_matches[argument_index].iter()
             {
@@ -4814,10 +4883,26 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
                 let declared_type = parameters[parameter_index].annotated_type();
                 let argument_type = argument_types.get_for_declared_type(declared_type);
+                let inferred_argument_type = if matches!(argument, Argument::Keywords) {
+                    keyword_context
+                        .as_deref()
+                        .and_then(|context| {
+                            keyword_context_field_type(
+                                parameters,
+                                argument_types,
+                                context,
+                                parameter_index,
+                            )
+                        })
+                        .or(variadic_argument_type)
+                        .unwrap_or(argument_type)
+                } else {
+                    variadic_argument_type.unwrap_or(argument_type)
+                };
 
                 let specialization_result = builder.infer_map(
                     declared_type,
-                    variadic_argument_type.unwrap_or(argument_type),
+                    inferred_argument_type,
                     |(identity, _, inferred_ty)| {
                         // Avoid widening the inferred type if it is already assignable to the
                         // preferred declared type.
@@ -4967,7 +5052,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     argument_index,
                     adjusted_argument_index,
                     argument,
-                    // Splatted arguments are inferred without type context.
+                    argument_types,
                     argument_types.get_default().unwrap_or(Type::unknown()),
                 ),
                 _ => {
@@ -5218,6 +5303,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         argument_index: usize,
         adjusted_argument_index: Option<usize>,
         argument: Argument<'a>,
+        argument_types: &CallArgumentTypes<'db>,
         argument_type: Type<'db>,
     ) {
         if let Some(unpacked_keys) =
@@ -5264,7 +5350,22 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 None
             };
 
+        let context = keyword_argument_context(
+            self.signature.parameters(),
+            &self.argument_matches[argument_index],
+        );
+
         for parameter_index in &self.argument_matches[argument_index].parameters {
+            let contextual_value_type = if context.is_empty() {
+                None
+            } else {
+                keyword_context_field_type(
+                    self.signature.parameters(),
+                    argument_types,
+                    &context,
+                    *parameter_index,
+                )
+            };
             let value_type = if let Some(value_type) = value_type_paramspec {
                 value_type
             } else {
@@ -5272,9 +5373,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     .keyword_name()
                     .map(Name::as_str);
 
-                argument_type
-                    .getitem_dunder_call(self.db, parameter_name)
-                    .unwrap_or(Type::unknown())
+                contextual_value_type.unwrap_or_else(|| {
+                    argument_type
+                        .getitem_dunder_call(self.db, parameter_name)
+                        .unwrap_or(Type::unknown())
+                })
             };
 
             self.check_argument_type(
